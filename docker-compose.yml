@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: digantara_pg
+    environment:
+      POSTGRES_USER: dg
+      POSTGRES_PASSWORD: dgpass
+      POSTGRES_DB: dg_passes
+    ports:
+      - "5432:5432"
+    volumes:
+      - dg_pgdata:/var/lib/postgresql/data
+volumes:
+  dg_pgdata:
