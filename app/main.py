@@ -4,18 +4,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import logging
+from datetime import datetime
+
 import psycopg
 from psycopg import OperationalError, IntegrityError, DataError, ProgrammingError, InterfaceError
+from psycopg.rows import dict_row
 
-from fastapi import FastAPI, Request, Query, status
+from fastapi import FastAPI, Request, Query, status, HTTPException
 from fastapi.responses import JSONResponse
 
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-
-from datetime import datetime
-from psycopg.rows import dict_row
 
 from app.db.conn import check_db, get_conn
 
@@ -81,7 +81,6 @@ def db_health(request: Request):
     return {"db": "ok"}
 
 
-# Example query endpoint (works after passes table exists)
 @app.get("/passes")
 @limiter.limit("60/minute")
 def get_passes(
@@ -91,19 +90,29 @@ def get_passes(
     end: datetime = Query(...),
     limit: int = Query(200, ge=1, le=1000),
 ):
+    # ✅ Guard: invalid time range
+    if start >= end:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid time window: 'start' must be strictly earlier than 'end'.",
+        )
+
     with get_conn() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            # ✅ Overlap logic:
+            # A pass overlaps the query window if:
+            #   pass.start < window.end  AND  pass.end > window.start
             cur.execute(
                 """
                 SELECT satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
                 FROM passes
                 WHERE ground_station_id = %s
-                  AND start_ts >= %s
                   AND start_ts < %s
+                  AND end_ts > %s
                 ORDER BY start_ts
                 LIMIT %s
                 """,
-                (gs_id, start, end, limit),
+                (gs_id, end, start, limit),
             )
             rows = cur.fetchall()
 
