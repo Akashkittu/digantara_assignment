@@ -4,14 +4,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import psycopg
 from psycopg import OperationalError, IntegrityError, DataError, ProgrammingError, InterfaceError
 from psycopg.rows import dict_row
 
 from fastapi import FastAPI, Request, Query, status, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -19,7 +19,6 @@ from slowapi.errors import RateLimitExceeded
 
 from app.db.conn import check_db, get_conn
 from app.schedule.optimizer import PassItem, best_non_overlapping_weighted, top_k_passes
-from fastapi.responses import JSONResponse, HTMLResponse
 
 
 app = FastAPI(title="Digantara Ground Pass Prediction", version="0.1.0")
@@ -106,6 +105,29 @@ def get_ground_stations(
     return {"count": len(rows), "items": rows}
 
 
+# ----------------------------
+# Time window helpers (backend enforcement)
+# ----------------------------
+
+def _to_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+MAX_QUERY_WINDOW = timedelta(days=7)
+
+
+def _validate_window(qstart: datetime, qend: datetime) -> None:
+    if qstart >= qend:
+        raise HTTPException(status_code=400, detail="Invalid time window: 'start' must be < 'end'.")
+    if (qend - qstart) > MAX_QUERY_WINDOW:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid time window: maximum allowed range is {MAX_QUERY_WINDOW.days} days.",
+        )
+
+
 @app.get("/passes")
 @limiter.limit("60/minute")
 def get_passes(
@@ -115,12 +137,10 @@ def get_passes(
     end: datetime = Query(...),
     limit: int = Query(200, ge=1, le=1000),
 ):
-    # ✅ Guard: invalid time range
-    if start >= end:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid time window: 'start' must be strictly earlier than 'end'.",
-        )
+    # ✅ Backend enforcement: convert to UTC + validate <= 7 days
+    qstart = _to_utc(start)
+    qend = _to_utc(end)
+    _validate_window(qstart, qend)
 
     with get_conn() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -136,7 +156,7 @@ def get_passes(
                 ORDER BY start_ts
                 LIMIT %s
                 """,
-                (gs_id, end, start, limit),
+                (gs_id, qend, qstart, limit),
             )
             rows = cur.fetchall()
 
@@ -146,12 +166,6 @@ def get_passes(
 # ----------------------------
 # Schedule / Optimization APIs
 # ----------------------------
-
-def _to_utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
 
 def _clip_row_to_window(row: dict, qstart: datetime, qend: datetime) -> PassItem | None:
     s = max(row["start_ts"], qstart)
@@ -184,9 +198,7 @@ def schedule_best(
 ):
     qstart = _to_utc(start)
     qend = _to_utc(end)
-
-    if qstart >= qend:
-        raise HTTPException(status_code=400, detail="Invalid time window: 'start' must be < 'end'.")
+    _validate_window(qstart, qend)
 
     with get_conn() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -261,9 +273,7 @@ def schedule_top(
 ):
     qstart = _to_utc(start)
     qend = _to_utc(end)
-
-    if qstart >= qend:
-        raise HTTPException(status_code=400, detail="Invalid time window: 'start' must be < 'end'.")
+    _validate_window(qstart, qend)
 
     with get_conn() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -323,6 +333,8 @@ def schedule_top(
             for p in topk
         ],
     }
+
+
 @app.get("/ui", response_class=HTMLResponse)
 @limiter.limit("60/minute")
 def ui(request: Request):
