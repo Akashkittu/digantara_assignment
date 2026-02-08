@@ -1,142 +1,295 @@
 # Digantara — Ground Pass Prediction (Backend)
 
 Backend service that:
-- Stores satellites + TLEs (CelesTrak)
-- Predicts ground passes using SGP4 + visibility (elevation)
-- Persists pass windows in Postgres for fast queries
-- Supports overlap queries + scheduling/optimization APIs (best non-overlapping schedule, top-K)
-- Has rate limiting + clean DB error handling
-- Includes a lightweight demo UI at `/ui` + Swagger at `/docs`
+- Fetches **real-time TLEs** from **CelesTrak**
+- Propagates satellite orbits using **SGP4**
+- Predicts **visible ground passes** (start/end + duration + max elevation)
+- Persists pass windows in **PostgreSQL** for fast overlap queries
+- Exposes scheduling APIs: **best non-overlapping schedule** + **top‑K passes**
+- Includes **rate limiting**, clean DB error handling, and a lightweight **demo UI** (`/ui`)
+
+> This repo is structured for the Digantara backend assignment: **50 ground stations**, predict for **next 7 days**, enforce **minimum pass duration = 5s**, and support **sub-second queries** via indexing + precomputation.
+
+---
+
+## Contents
+- [Tech Stack](#tech-stack)
+- [Quick Start](#quick-start)
+- [Data Pipeline](#data-pipeline)
+- [API](#api)
+- [Sample Outputs](#sample-outputs)
+- [Database Schema](#database-schema)
+- [Design Notes](#design-notes)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Tech Stack
-- FastAPI + Uvicorn
-- PostgreSQL 16 (Docker)
-- psycopg (DB driver)
-- Alembic migrations
-- slowapi rate limiting
-- SGP4 propagation
+- **FastAPI** + **Uvicorn**
+- **PostgreSQL 16** (Docker)
+- **psycopg** (DB driver)
+- **Alembic** (migrations)
+- **slowapi** (rate limiting)
+- **SGP4** (propagation)
 
 ---
 
-## Quick Start (Windows PowerShell) — No venv
+## Quick Start
+
+### 0) Prereqs
+- Python **3.12** (Windows recommended commands use `py -3.12`)
+- Docker Desktop (for Postgres)
+
 ### 1) Start Postgres
 ```powershell
 docker compose up -d
-2) Create .env
-Copy the example:
+docker ps
+```
 
+### 2) Configure env
+Copy:
+```powershell
 copy .env.example .env
-.env.example:
+```
 
+`.env`:
+```env
 DATABASE_URL=postgresql://dg:dgpass@localhost:5432/dg_passes
-3) Install deps (no venv)
-py -3.12 -m pip install --user -r requirements.txt
-4) Run migrations
+```
+
+### 3) Install dependencies
+```powershell
+py -3.12 -m pip install -r requirements.txt
+```
+
+### 4) Create tables (migrations)
+```powershell
 py -3.12 -m alembic upgrade head
-5) Seed ground stations
-Recommended (module mode):
+```
 
+### 5) Seed 50 ground stations
+```powershell
 py -3.12 -m app.scripts.seed_ground_stations
-6) Run API
+```
+
+### 6) Run the API
+```powershell
 py -3.12 -m uvicorn app.main:app --reload
+```
+
 Open:
+- Swagger docs: `http://127.0.0.1:8000/docs`
+- Demo UI: `http://127.0.0.1:8000/ui`
+- Health: `http://127.0.0.1:8000/health`
 
-Swagger UI: http://127.0.0.1:8000/docs
+---
 
-Demo UI: http://127.0.0.1:8000/ui
+## Data Pipeline
 
-Health: http://127.0.0.1:8000/health
+### A) Fetch latest TLEs (CelesTrak)
+Fetch from the “active” group (default), store satellites + TLEs:
+```powershell
+py -3.12 -m app.scripts.fetch_tles --group active --limit 200
+```
 
-Database (Docker)
-Container name is digantara_pg.
+Notes:
+- `--group` maps to CelesTrak group names (e.g., `active`, `stations`, etc.)
+- `--limit` limits number of TLE triplets ingested
 
-Useful checks:
+### B) Generate passes (store in DB)
+Generate pass windows for the next N days by scanning in time chunks.
 
-docker exec -it digantara_pg psql -U dg -d dg_passes -c "select count(*) from ground_stations;"
-docker exec -it digantara_pg psql -U dg -d dg_passes -c "select count(*) from satellites;"
-docker exec -it digantara_pg psql -U dg -d dg_passes -c "select count(*) from tles;"
-docker exec -it digantara_pg psql -U dg -d dg_passes -c "select count(*) from passes;"
-Endpoints
-Health
-GET /health
+**Fast demo run (recommended first):**
+```powershell
+py -3.12 -m app.scripts.generate_passes_7d_batched --days 2 --gs-limit 50 --sat-limit 30 --chunk-hours 24 --step 60 --delete-existing
+```
 
-GET /db/health
+**Full run (assignment-style):**
+```powershell
+py -3.12 -m app.scripts.generate_passes_7d_batched --days 7 --gs-limit 50 --sat-limit 200 --chunk-hours 24 --step 60 --delete-existing
+```
 
-Ground stations
-GET /ground-stations?limit=200
+Key flags:
+- `--days` number of days to generate (max 7 recommended)
+- `--gs-limit` number of ground stations (expected **50**)
+- `--sat-limit` number of satellites to process
+- `--chunk-hours` batch size for time window processing
+- `--step` coarse scan step seconds (tradeoff accuracy vs speed)
+- `--delete-existing` clears existing passes first (avoids duplicates)
 
-Pass retrieval (overlap window query)
-Returns passes that overlap the query window:
+---
 
-overlaps if: pass.start_ts < end AND pass.end_ts > start
+## API
 
-GET /passes?gs_id=1&start=...&end=...&limit=200
+All endpoints are **GET** and are rate-limited.
 
-Example (PowerShell):
+### `GET /health`
+Sanity check.
+```bash
+curl http://127.0.0.1:8000/health
+```
 
-curl.exe "http://127.0.0.1:8000/passes?gs_id=1&start=2026-02-08T06:00:00%2B00:00&end=2026-02-09T06:00:00%2B00:00&limit=200"
-Scheduling / Optimization (must-have)
-1) Best non-overlapping schedule (optimize objective)
-Selects a non-overlapping set of passes that maximizes the chosen metric:
+### `GET /db/health`
+Verifies DB connectivity.
+```bash
+curl http://127.0.0.1:8000/db/health
+```
 
-metric=duration → max total duration
-
-metric=max_elev → max total max-elevation sum
-
-GET /schedule/best?gs_id=...&start=...&end=...&metric=duration|max_elev
+### `GET /ground-stations`
+List ground stations.
+Query params:
+- `limit` (default 200, max 500)
 
 Example:
+```bash
+curl "http://127.0.0.1:8000/ground-stations?limit=50"
+```
 
-curl.exe "http://127.0.0.1:8000/schedule/best?gs_id=1&start=2026-02-08T06:00:00%2B00:00&end=2026-02-09T06:00:00%2B00:00&metric=duration"
-2) Top-K passes (simple ranking)
-Returns best individual passes by metric (no non-overlap constraint):
-GET /schedule/top?gs_id=...&start=...&end=...&metric=duration|max_elev&k=5
+### `GET /passes`
+Overlap query: returns all passes that overlap a query window.
+
+Query params:
+- `gs_id` (required) ground station DB id
+- `start` (required) ISO datetime
+- `end` (required) ISO datetime
+- `limit` (default 200, max 1000)
+
+Overlap logic:
+- A pass overlaps the window if: `pass.start < window.end AND pass.end > window.start`
 
 Example:
+```bash
+curl "http://127.0.0.1:8000/passes?gs_id=1&start=2026-02-08T00:00:00Z&end=2026-02-09T00:00:00Z&limit=50"
+```
 
-curl.exe "http://127.0.0.1:8000/schedule/top?gs_id=1&start=2026-02-08T06:00:00%2B00:00&end=2026-02-09T06:00:00%2B00:00&metric=max_elev&k=5"
-Demo UI (/ui)
-Open: http://127.0.0.1:8000/ui
+### `GET /schedule/best`
+Computes the **best non-overlapping schedule** for a ground station over a window using **Weighted Interval Scheduling**.
 
-Features:
+Query params:
+- `gs_id`, `start`, `end` (required)
+- `metric` (`duration` or `max_elev`, default `duration`)
+- `satellite_id` (optional filter)
 
-datetime picker (no need to type ISO)
+Example:
+```bash
+curl "http://127.0.0.1:8000/schedule/best?gs_id=1&start=2026-02-08T00:00:00Z&end=2026-02-09T00:00:00Z&metric=duration"
+```
 
-quick buttons: Now → +6h, +24h, +7d
+### `GET /schedule/top`
+Returns the **top‑K** passes in the window (by metric).
 
-enforces max 7-day window in the UI (assignment rule)
+Query params:
+- `gs_id`, `start`, `end` (required)
+- `metric` (`duration` or `max_elev`, default `duration`)
+- `k` (default 5, max 100)
+- `satellite_id` (optional filter)
 
-buttons to call: /passes, /schedule/best, /schedule/top
+Example:
+```bash
+curl "http://127.0.0.1:8000/schedule/top?gs_id=1&start=2026-02-08T00:00:00Z&end=2026-02-09T00:00:00Z&metric=duration&k=3"
+```
 
-link to Swagger /docs
+### `GET /ui`
+Lightweight HTML UI to test:
+- `/passes`
+- `/schedule/best`
+- `/schedule/top`
 
-Note: UI sends datetime-local values (no timezone). Backend treats them as UTC.
+Open:
+`http://127.0.0.1:8000/ui`
 
-Rate Limiting + Error Handling
-Rate limiting
-slowapi in-memory limiter (keyed by client IP).
+---
 
-Designed for the assignment; in production, replace with Redis-backed limiter.
+## Sample Outputs
 
-DB error handling
-Global psycopg.Error handler maps DB errors to clean JSON without leaking SQL internals:
+### Option 1: Generate **real** outputs automatically (recommended)
+Create a script: `app/scripts/generate_sample_outputs.py` (provided separately in this project work) and run:
 
-DB unavailable → 503
+```powershell
+py -3.12 -u app\scripts\generate_sample_outputs.py --gs-id 1 --hours 24 --metric duration --k 3 --out SAMPLE_OUTPUTS.md
+```
 
-Bad params/data → 400
+This writes `SAMPLE_OUTPUTS.md` with **real JSON responses** from your running server.
 
-Constraint conflicts → 409
+### Option 2: Manual
+- Open `/docs` → try `/passes`, `/schedule/best`, `/schedule/top`
+- Copy JSON and paste into README under “Sample Outputs”
 
-Query issues → 500
+### Optional: UI Screenshot
+1) Open `http://127.0.0.1:8000/ui`  
+2) Take screenshot (Windows: `Win + Shift + S`)  
+3) Save as `docs/ui.png`  
+4) Add:
+```md
+![Demo UI](docs/ui.png)
+```
 
-Pass Generation (batch scripts)
-This project supports generating passes and storing them in passes so queries stay fast.
+---
 
-Example (1 sat × 50 GS × 7 days, chunked):
+## Database Schema
 
-py -3.12 -m app.scripts.generate_passes_7d_batched --days 7 --gs-limit 50 --sat-limit 1 --chunk-hours 24 --step 60 --delete-existing
-Example (smaller bulk test):
+Core tables (via Alembic migrations):
 
-py -3.12 -m app.scripts.generate_passes_bulk --hours 6 --gs-limit 5 --step 30 --delete-existing
+- `ground_stations(id, code, name, lat, lon, alt_m)`
+- `satellites(id, norad_id, name, created_at)`
+- `tles(id, satellite_id, line1, line2, epoch, fetched_at)`
+- `passes(id, satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg)`
+
+Performance indexes:
+- `passes(ground_station_id, start_ts)`
+- `passes(ground_station_id, end_ts)`
+- `passes(satellite_id, start_ts)`
+- `tles(satellite_id, fetched_at)`
+
+---
+
+## Design Notes
+
+### Why precompute passes?
+For *50 ground stations × many satellites × 7 days*, pass prediction can be huge. Precomputing into Postgres gives:
+- Fast overlap queries (index-backed)
+- Fast scheduling (window queries + O(n log n) DP)
+
+### Pass prediction approach
+- Use SGP4 for satellite state over time
+- Convert to local topocentric frame and compute **elevation**
+- Detect visibility windows (elevation > 0°)
+- Refine rise/set times using bisection
+- Enforce **minimum pass duration >= 5 seconds**
+
+### Scheduling
+- `best` uses **Weighted Interval Scheduling** (O(n log n))
+- `top` returns top‑K passes by metric (duration or max elevation)
+
+### Time handling
+- All times are treated as **UTC** internally (`timezone-aware` timestamps)
+
+---
+
+## Troubleshooting
+
+### `/passes` returns empty
+Most common reason: passes weren’t generated yet.
+1) Fetch TLEs:
+```powershell
+py -3.12 -m app.scripts.fetch_tles --group active --limit 200
+```
+2) Generate passes:
+```powershell
+py -3.12 -m app.scripts.generate_passes_7d_batched --days 2 --gs-limit 50 --sat-limit 30 --chunk-hours 24 --step 60 --delete-existing
+```
+3) Re-query `/passes`.
+
+### Docker/Postgres not running
+- Check `docker ps`
+- Restart Docker Desktop
+- Re-run `docker compose up -d`
+
+### Alembic errors
+- Ensure `.env` exists and `DATABASE_URL` is correct
+- Verify Postgres port is `5432` and container is healthy
+
+---
+
+## License
+Internal assignment code (use as per assignment instructions).
