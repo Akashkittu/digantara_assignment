@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 import psycopg
 from psycopg import OperationalError, IntegrityError, DataError, ProgrammingError, InterfaceError
@@ -18,6 +18,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from app.db.conn import check_db, get_conn
+from app.schedule.optimizer import PassItem, best_non_overlapping_weighted, top_k_passes
 
 
 app = FastAPI(title="Digantara Ground Pass Prediction", version="0.1.0")
@@ -81,7 +82,7 @@ def db_health(request: Request):
     return {"db": "ok"}
 
 
-# ✅ NEW: List all ground stations
+# ✅ List all ground stations
 @app.get("/ground-stations")
 @limiter.limit("60/minute")
 def get_ground_stations(
@@ -126,7 +127,7 @@ def get_passes(
             # pass overlaps window if pass.start < window.end AND pass.end > window.start
             cur.execute(
                 """
-                SELECT satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
+                SELECT id, satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
                 FROM passes
                 WHERE ground_station_id = %s
                   AND start_ts < %s
@@ -139,3 +140,185 @@ def get_passes(
             rows = cur.fetchall()
 
     return {"count": len(rows), "items": rows}
+
+
+# ----------------------------
+# Schedule / Optimization APIs
+# ----------------------------
+
+def _to_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _clip_row_to_window(row: dict, qstart: datetime, qend: datetime) -> PassItem | None:
+    s = max(row["start_ts"], qstart)
+    e = min(row["end_ts"], qend)
+    if e <= s:
+        return None
+    dur = int((e - s).total_seconds())
+    if dur < 5:
+        return None
+    return PassItem(
+        id=row["id"],
+        satellite_id=row["satellite_id"],
+        ground_station_id=row["ground_station_id"],
+        start_ts=s,
+        end_ts=e,
+        duration_s=dur,
+        max_elev_deg=float(row["max_elev_deg"]),
+    )
+
+
+@app.get("/schedule/best")
+@limiter.limit("30/minute")
+def schedule_best(
+    request: Request,
+    gs_id: int = Query(..., ge=1),
+    start: datetime = Query(...),
+    end: datetime = Query(...),
+    metric: str = Query("duration", pattern="^(duration|max_elev)$"),
+    satellite_id: int | None = Query(None, ge=1),
+):
+    qstart = _to_utc(start)
+    qend = _to_utc(end)
+
+    if qstart >= qend:
+        raise HTTPException(status_code=400, detail="Invalid time window: 'start' must be < 'end'.")
+
+    with get_conn() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if satellite_id is None:
+                cur.execute(
+                    """
+                    SELECT id, satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
+                    FROM passes
+                    WHERE ground_station_id = %s
+                      AND start_ts < %s
+                      AND end_ts > %s
+                    ORDER BY end_ts ASC
+                    """,
+                    (gs_id, qend, qstart),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
+                    FROM passes
+                    WHERE ground_station_id = %s
+                      AND satellite_id = %s
+                      AND start_ts < %s
+                      AND end_ts > %s
+                    ORDER BY end_ts ASC
+                    """,
+                    (gs_id, satellite_id, qend, qstart),
+                )
+            rows = cur.fetchall()
+
+    items: list[PassItem] = []
+    for r in rows:
+        p = _clip_row_to_window(r, qstart, qend)
+        if p:
+            items.append(p)
+
+    chosen, score = best_non_overlapping_weighted(items, metric=metric)  # type: ignore[arg-type]
+
+    return {
+        "gs_id": gs_id,
+        "satellite_id": satellite_id,
+        "start": qstart.isoformat(),
+        "end": qend.isoformat(),
+        "metric": metric,
+        "score": score,
+        "count": len(chosen),
+        "passes": [
+            {
+                "id": p.id,
+                "satellite_id": p.satellite_id,
+                "ground_station_id": p.ground_station_id,
+                "start_ts": p.start_ts.isoformat(),
+                "end_ts": p.end_ts.isoformat(),
+                "duration_s": p.duration_s,
+                "max_elev_deg": p.max_elev_deg,
+            }
+            for p in chosen
+        ],
+    }
+
+
+@app.get("/schedule/top")
+@limiter.limit("30/minute")
+def schedule_top(
+    request: Request,
+    gs_id: int = Query(..., ge=1),
+    start: datetime = Query(...),
+    end: datetime = Query(...),
+    metric: str = Query("duration", pattern="^(duration|max_elev)$"),
+    k: int = Query(5, ge=1, le=100),
+    satellite_id: int | None = Query(None, ge=1),
+):
+    qstart = _to_utc(start)
+    qend = _to_utc(end)
+
+    if qstart >= qend:
+        raise HTTPException(status_code=400, detail="Invalid time window: 'start' must be < 'end'.")
+
+    with get_conn() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if satellite_id is None:
+                cur.execute(
+                    """
+                    SELECT id, satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
+                    FROM passes
+                    WHERE ground_station_id = %s
+                      AND start_ts < %s
+                      AND end_ts > %s
+                    ORDER BY end_ts ASC
+                    """,
+                    (gs_id, qend, qstart),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
+                    FROM passes
+                    WHERE ground_station_id = %s
+                      AND satellite_id = %s
+                      AND start_ts < %s
+                      AND end_ts > %s
+                    ORDER BY end_ts ASC
+                    """,
+                    (gs_id, satellite_id, qend, qstart),
+                )
+            rows = cur.fetchall()
+
+    items: list[PassItem] = []
+    for r in rows:
+        p = _clip_row_to_window(r, qstart, qend)
+        if p:
+            items.append(p)
+
+    topk = top_k_passes(items, metric=metric, k=k)  # type: ignore[arg-type]
+
+    return {
+        "gs_id": gs_id,
+        "satellite_id": satellite_id,
+        "start": qstart.isoformat(),
+        "end": qend.isoformat(),
+        "metric": metric,
+        "k": k,
+        "count": len(topk),
+        "passes": [
+            {
+                "id": p.id,
+                "satellite_id": p.satellite_id,
+                "ground_station_id": p.ground_station_id,
+                "start_ts": p.start_ts.isoformat(),
+                "end_ts": p.end_ts.isoformat(),
+                "duration_s": p.duration_s,
+                "max_elev_deg": p.max_elev_deg,
+            }
+            for p in topk
+        ],
+    }
