@@ -81,6 +81,29 @@ def db_health(request: Request):
     return {"db": "ok"}
 
 
+# ✅ NEW: List all ground stations
+@app.get("/ground-stations")
+@limiter.limit("60/minute")
+def get_ground_stations(
+    request: Request,
+    limit: int = Query(200, ge=1, le=500),
+):
+    with get_conn() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT id, code, name, lat, lon, alt_m
+                FROM ground_stations
+                ORDER BY code
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+
+    return {"count": len(rows), "items": rows}
+
+
 @app.get("/passes")
 @limiter.limit("60/minute")
 def get_passes(
@@ -100,8 +123,7 @@ def get_passes(
     with get_conn() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             # ✅ Overlap logic:
-            # A pass overlaps the query window if:
-            #   pass.start < window.end  AND  pass.end > window.start
+            # pass overlaps window if pass.start < window.end AND pass.end > window.start
             cur.execute(
                 """
                 SELECT satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
