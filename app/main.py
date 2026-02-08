@@ -19,6 +19,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.db.conn import check_db, get_conn
 from app.schedule.optimizer import PassItem, best_non_overlapping_weighted, top_k_passes
+from fastapi.responses import JSONResponse, HTMLResponse
 
 
 app = FastAPI(title="Digantara Ground Pass Prediction", version="0.1.0")
@@ -322,3 +323,189 @@ def schedule_top(
             for p in topk
         ],
     }
+@app.get("/ui", response_class=HTMLResponse)
+@limiter.limit("60/minute")
+def ui(request: Request):
+    return HTMLResponse(
+        """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Ground Pass Demo UI</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; max-width: 1100px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; align-items: end; }
+    label { font-size: 12px; color: #333; display: block; margin-bottom: 4px; }
+    input, select { padding: 8px; width: 260px; }
+    input[type="datetime-local"]{ width: 320px; }
+    button { padding: 10px 14px; cursor: pointer; }
+    .smallbtn { padding: 8px 10px; font-size: 12px; }
+    pre { background:#111; color:#0f0; padding:12px; overflow:auto; border-radius: 8px; }
+    .hint { color:#666; font-size: 12px; margin-top: 8px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
+  </style>
+</head>
+<body>
+  <h2>Digantara Ground Pass Demo</h2>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Ground station id (gs_id)</label>
+        <input id="gs_id" type="number" value="1" min="1" />
+      </div>
+
+      <div>
+        <label>Start (UTC)</label>
+        <input id="start" type="datetime-local" step="1" />
+      </div>
+
+      <div>
+        <label>End (UTC) — max 7 days</label>
+        <input id="end" type="datetime-local" step="1" />
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>Metric</label>
+        <select id="metric">
+          <option value="duration">duration</option>
+          <option value="max_elev">max_elev</option>
+        </select>
+      </div>
+
+      <div>
+        <label>Top K</label>
+        <input id="k" type="number" value="5" min="1" max="100" />
+      </div>
+
+      <div>
+        <label>Optional satellite_id</label>
+        <input id="satellite_id" type="number" placeholder="(blank = all)" min="1" />
+      </div>
+    </div>
+
+    <div class="row">
+      <button class="smallbtn" onclick="setNowUtc()">Now UTC</button>
+      <button class="smallbtn" onclick="setRangeHours(6)">Now → +6h</button>
+      <button class="smallbtn" onclick="setRangeHours(24)">Now → +24h</button>
+      <button class="smallbtn" onclick="setRangeDays(7)">Now → +7d</button>
+    </div>
+
+    <div class="row">
+      <button onclick="callApi('passes')">Get Passes</button>
+      <button onclick="callApi('best')">Best Schedule</button>
+      <button onclick="callApi('top')">Top K</button>
+      <button onclick="window.open('/docs','_blank')">Open Swagger (/docs)</button>
+    </div>
+  </div>
+
+  <pre id="out">{ "ready": true }</pre>
+
+  <div class="hint">
+    Times are treated as <b>UTC</b>. Max allowed window is <b>7 days</b> (assignment rule).
+  </div>
+
+<script>
+  function qs(id){ return document.getElementById(id).value.trim(); }
+  function pad2(n){ return String(n).padStart(2,'0'); }
+
+  // Convert Date -> "YYYY-MM-DDTHH:MM:SS" in UTC for datetime-local input
+  function toDatetimeLocalUTC(d){
+    return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())}T${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`;
+  }
+
+  // Parse "YYYY-MM-DDTHH:MM:SS" as UTC Date object
+  function parseUtcFromDatetimeLocal(s){
+    const [datePart, timePart] = s.split("T");
+    const [Y,M,D] = datePart.split("-").map(Number);
+    const [h,m,sec] = timePart.split(":").map(Number);
+    return new Date(Date.UTC(Y, M-1, D, h, m, sec || 0));
+  }
+
+  function setNowUtc(){
+    const now = new Date();
+    document.getElementById('start').value = toDatetimeLocalUTC(now);
+    const plus24 = new Date(now.getTime() + 24*3600*1000);
+    document.getElementById('end').value = toDatetimeLocalUTC(plus24);
+  }
+
+  function setRangeHours(h){
+    const now = new Date();
+    const end = new Date(now.getTime() + h*3600*1000);
+    document.getElementById('start').value = toDatetimeLocalUTC(now);
+    document.getElementById('end').value = toDatetimeLocalUTC(end);
+  }
+
+  function setRangeDays(d){
+    if(d > 7) d = 7; // hard cap
+    const now = new Date();
+    const end = new Date(now.getTime() + d*24*3600*1000);
+    document.getElementById('start').value = toDatetimeLocalUTC(now);
+    document.getElementById('end').value = toDatetimeLocalUTC(end);
+  }
+
+  // Default: now -> +24h
+  setRangeDays(1);
+
+  async function callApi(kind){
+    const gs_id = qs('gs_id');
+    const start = qs('start'); // "YYYY-MM-DDTHH:MM:SS"
+    const end = qs('end');
+    const metric = qs('metric');
+    const k = qs('k');
+    const satellite_id = qs('satellite_id');
+
+    const out = document.getElementById('out');
+
+    if(!start || !end){
+      out.textContent = "Error: start and end are required.";
+      return;
+    }
+
+    // ✅ Enforce max 7 days window in UI
+    const ds = parseUtcFromDatetimeLocal(start);
+    const de = parseUtcFromDatetimeLocal(end);
+    const diffMs = de - ds;
+
+    if(diffMs <= 0){
+      out.textContent = "Error: end must be after start.";
+      return;
+    }
+
+    const maxMs = 7 * 24 * 3600 * 1000;
+    if(diffMs > maxMs){
+      out.textContent = "Error: Maximum allowed window is 7 days (assignment rule).";
+      return;
+    }
+
+    let url = '';
+    const enc = encodeURIComponent;
+
+    if(kind === 'passes'){
+      url = `/passes?gs_id=${enc(gs_id)}&start=${enc(start)}&end=${enc(end)}&limit=200`;
+    } else if(kind === 'best'){
+      url = `/schedule/best?gs_id=${enc(gs_id)}&start=${enc(start)}&end=${enc(end)}&metric=${enc(metric)}`;
+      if(satellite_id) url += `&satellite_id=${enc(satellite_id)}`;
+    } else if(kind === 'top'){
+      url = `/schedule/top?gs_id=${enc(gs_id)}&start=${enc(start)}&end=${enc(end)}&metric=${enc(metric)}&k=${enc(k)}`;
+      if(satellite_id) url += `&satellite_id=${enc(satellite_id)}`;
+    }
+
+    out.textContent = "Loading...";
+
+    try{
+      const res = await fetch(url);
+      const data = await res.json();
+      out.textContent = JSON.stringify({ url, status: res.status, data }, null, 2);
+    } catch(e){
+      out.textContent = "Error: " + e.toString();
+    }
+  }
+</script>
+</body>
+</html>
+""".strip()
+    )
