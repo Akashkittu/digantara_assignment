@@ -1,4 +1,8 @@
 import os
+from dotenv import load_dotenv
+
+# Load .env when any module imports config (scripts included)
+load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
