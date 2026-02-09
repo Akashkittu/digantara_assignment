@@ -5,6 +5,7 @@ load_dotenv()
 
 import logging
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
 import psycopg
 from psycopg import OperationalError, IntegrityError, DataError, ProgrammingError, InterfaceError
@@ -334,6 +335,123 @@ def schedule_top(
     }
 
 
+# ----------------------------
+# ✅ NEW: Network-level scheduling (entire network)
+# ----------------------------
+
+@app.get("/network/schedule/best")
+@limiter.limit("15/minute")
+def network_schedule_best(
+    request: Request,
+    start: datetime = Query(...),
+    end: datetime = Query(...),
+    metric: str = Query("duration", pattern="^(duration|max_elev)$"),
+    satellite_id: int | None = Query(None, ge=1),
+):
+    """
+    Network-level optimizer:
+    - Pull passes for ALL ground stations in the time window
+    - Run "best non-overlapping schedule" per ground station
+    - Aggregate results and compute unique satellites tracked across network
+    """
+    qstart = _to_utc(start)
+    qend = _to_utc(end)
+    _validate_window(qstart, qend)
+
+    with get_conn() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if satellite_id is None:
+                cur.execute(
+                    f"""
+                    SELECT id, satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
+                    FROM passes
+                    WHERE {_OVERLAP_SQL}
+                    ORDER BY ground_station_id ASC, end_ts ASC
+                    """,
+                    (qstart, qend),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    SELECT id, satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
+                    FROM passes
+                    WHERE satellite_id = %s
+                      AND {_OVERLAP_SQL}
+                    ORDER BY ground_station_id ASC, end_ts ASC
+                    """,
+                    (satellite_id, qstart, qend),
+                )
+
+            rows = cur.fetchall()
+
+    # Group rows by ground station and optimize each station
+    by_station: dict[int, list[dict]] = defaultdict(list)
+    for r in rows:
+        by_station[int(r["ground_station_id"])].append(r)
+
+    schedule_by_station = []
+    all_chosen_passes = []
+
+    total_score = 0.0
+    total_tracking_time_s = 0
+    unique_satellites: set[int] = set()
+
+    for gs_id, gs_rows in by_station.items():
+        items: list[PassItem] = []
+        for r in gs_rows:
+            p = _clip_row_to_window(r, qstart, qend)
+            if p:
+                items.append(p)
+
+        if not items:
+            continue
+
+        chosen, score = best_non_overlapping_weighted(items, metric=metric)  # type: ignore[arg-type]
+        total_score += float(score)
+
+        station_passes = []
+        for p in chosen:
+            total_tracking_time_s += int(p.duration_s)
+            unique_satellites.add(int(p.satellite_id))
+
+            outp = {
+                "id": p.id,
+                "satellite_id": p.satellite_id,
+                "ground_station_id": p.ground_station_id,
+                "start_ts": p.start_ts.isoformat(),
+                "end_ts": p.end_ts.isoformat(),
+                "duration_s": p.duration_s,
+                "max_elev_deg": p.max_elev_deg,
+            }
+            station_passes.append(outp)
+            all_chosen_passes.append(outp)
+
+        schedule_by_station.append(
+            {
+                "gs_id": gs_id,
+                "score": float(score),
+                "count": len(station_passes),
+                "passes": station_passes,
+            }
+        )
+
+    # Sort stations by score (nice for readability)
+    schedule_by_station.sort(key=lambda x: x["score"], reverse=True)
+
+    return {
+        "start": qstart.isoformat(),
+        "end": qend.isoformat(),
+        "metric": metric,
+        "satellite_id": satellite_id,
+        "stations_used": len(schedule_by_station),
+        "total_passes_scheduled": len(all_chosen_passes),
+        "total_tracking_time_s": total_tracking_time_s,
+        "unique_satellites_tracked": len(unique_satellites),
+        "total_score": total_score,
+        "schedule_by_station": schedule_by_station,
+    }
+
+
 @app.get("/ui", response_class=HTMLResponse)
 @limiter.limit("60/minute")
 def ui(request: Request):
@@ -409,6 +527,7 @@ def ui(request: Request):
       <button onclick="callApi('passes')">Get Passes</button>
       <button onclick="callApi('best')">Best Schedule</button>
       <button onclick="callApi('top')">Top K</button>
+      <button onclick="callApi('network_best')">Network Best (All GS)</button>
       <button onclick="window.open('/docs','_blank')">Open Swagger (/docs)</button>
     </div>
   </div>
@@ -502,6 +621,9 @@ def ui(request: Request):
       if(satellite_id) url += `&satellite_id=${enc(satellite_id)}`;
     } else if(kind === 'top'){
       url = `/schedule/top?gs_id=${enc(gs_id)}&start=${enc(start)}&end=${enc(end)}&metric=${enc(metric)}&k=${enc(k)}`;
+      if(satellite_id) url += `&satellite_id=${enc(satellite_id)}`;
+    } else if(kind === 'network_best'){
+      url = `/network/schedule/best?start=${enc(start)}&end=${enc(end)}&metric=${enc(metric)}`;
       if(satellite_id) url += `&satellite_id=${enc(satellite_id)}`;
     }
 
