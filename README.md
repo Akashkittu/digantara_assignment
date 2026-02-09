@@ -215,11 +215,9 @@ This writes `SAMPLE_OUTPUTS.md` with **real JSON responses** from your running s
 - Open `/docs` → try `/passes`, `/schedule/best`, `/schedule/top`
 - Copy JSON and paste into README under “Sample Outputs”
 
-### Optional: UI Screenshot
-1) Open `http://127.0.0.1:8000/ui`  
-2) Take screenshot (Windows: `Win + Shift + S`)  
-3) Save as `docs/ui.png`  
-4) Add:
+### UI Screenshot
+1) Open `http://127.0.0.1:8000/ui`    
+2) Add:
 ```md
 ![Demo UI](docs/ui.png)
 ```
