@@ -128,6 +128,11 @@ def _validate_window(qstart: datetime, qend: datetime) -> None:
         )
 
 
+# ✅ For timestamptz columns, use tstzrange (NOT tsrange)
+# This matches your GiST index: GIST(ground_station_id, tstzrange(start_ts, end_ts, '[)'))
+_OVERLAP_SQL = "tstzrange(start_ts, end_ts, '[)') && tstzrange(%s, %s, '[)')"
+
+
 @app.get("/passes")
 @limiter.limit("60/minute")
 def get_passes(
@@ -144,19 +149,17 @@ def get_passes(
 
     with get_conn() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            # ✅ Overlap logic:
-            # pass overlaps window if pass.start < window.end AND pass.end > window.start
+            # ✅ Range overlap (uses GiST range index at scale)
             cur.execute(
-                """
+                f"""
                 SELECT id, satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
                 FROM passes
                 WHERE ground_station_id = %s
-                  AND start_ts < %s
-                  AND end_ts > %s
+                  AND {_OVERLAP_SQL}
                 ORDER BY start_ts
                 LIMIT %s
                 """,
-                (gs_id, qend, qstart, limit),
+                (gs_id, qstart, qend, limit),
             )
             rows = cur.fetchall()
 
@@ -204,28 +207,26 @@ def schedule_best(
         with conn.cursor(row_factory=dict_row) as cur:
             if satellite_id is None:
                 cur.execute(
-                    """
+                    f"""
                     SELECT id, satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
                     FROM passes
                     WHERE ground_station_id = %s
-                      AND start_ts < %s
-                      AND end_ts > %s
+                      AND {_OVERLAP_SQL}
                     ORDER BY end_ts ASC
                     """,
-                    (gs_id, qend, qstart),
+                    (gs_id, qstart, qend),
                 )
             else:
                 cur.execute(
-                    """
+                    f"""
                     SELECT id, satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
                     FROM passes
                     WHERE ground_station_id = %s
                       AND satellite_id = %s
-                      AND start_ts < %s
-                      AND end_ts > %s
+                      AND {_OVERLAP_SQL}
                     ORDER BY end_ts ASC
                     """,
-                    (gs_id, satellite_id, qend, qstart),
+                    (gs_id, satellite_id, qstart, qend),
                 )
             rows = cur.fetchall()
 
@@ -279,28 +280,26 @@ def schedule_top(
         with conn.cursor(row_factory=dict_row) as cur:
             if satellite_id is None:
                 cur.execute(
-                    """
+                    f"""
                     SELECT id, satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
                     FROM passes
                     WHERE ground_station_id = %s
-                      AND start_ts < %s
-                      AND end_ts > %s
+                      AND {_OVERLAP_SQL}
                     ORDER BY end_ts ASC
                     """,
-                    (gs_id, qend, qstart),
+                    (gs_id, qstart, qend),
                 )
             else:
                 cur.execute(
-                    """
+                    f"""
                     SELECT id, satellite_id, ground_station_id, start_ts, end_ts, duration_s, max_elev_deg
                     FROM passes
                     WHERE ground_station_id = %s
                       AND satellite_id = %s
-                      AND start_ts < %s
-                      AND end_ts > %s
+                      AND {_OVERLAP_SQL}
                     ORDER BY end_ts ASC
                     """,
-                    (gs_id, satellite_id, qend, qstart),
+                    (gs_id, satellite_id, qstart, qend),
                 )
             rows = cur.fetchall()
 
