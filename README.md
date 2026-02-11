@@ -121,16 +121,21 @@ Key flags:
 
 ## Verify data in Postgres (after Data Pipeline)
 
-**Step 1 — open `psql` inside the running Postgres container:**
+### A) Step 1 — open `psql` inside the running Postgres container:
+
 
 ```powershell
 docker exec -it digantara_pg psql -U dg -d dg_passes
 ```
 
-**Step 2 — Inside psql, run:**
- 
+### B) Step 2 — Inside psql, run:
+**lists all tables in the current database**
 ```powershell
 \dt
+```
+
+**Check data was generated:**
+```powershell
 select count(*) from satellites;
 select count(*) from tles;
 select count(*) from passes;
